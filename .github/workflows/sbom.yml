@@ -1,0 +1,21 @@
+name: SBOM
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write        # voor OIDC/cosign later
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Genereer CycloneDX-SBOM
+        uses: anchore/sbom-action@v0     # syft, multi-language
+        with:
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
