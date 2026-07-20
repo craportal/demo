@@ -25,7 +25,12 @@
 name: release-sbom
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ingest_url:
+        description: 'Optioneel: push de getekende SBOM naar deze pipeline-ingest (bv. https://william.dev.pipeline.trustengine.eu/ingest). Leeg = niet pushen.'
+        required: false
+        default: ''
   push:
     tags:
       - 'v*'
@@ -81,3 +86,26 @@ jobs:
             sbom.cdx.json
             sbom.cdx.json.bundle
           if-no-files-found: error
+
+      # 2.4 — keyless PUSH naar de pipeline-ingest (Fase 2.4). Alleen bij een
+      # handmatige dispatch mét ingest_url (tag/PR-runs slaan dit over → geen ruis).
+      # Auth = een kortlevend GitHub-OIDC-token; de gateway verifieert het tegen
+      # GitHub's JWKS en leest de repository-claim. Geen gedeelde sleutel.
+      - name: Push SBOM naar pipeline-ingest (keyless OIDC)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ingest_url != '' }}
+        env:
+          INGEST_URL: ${{ inputs.ingest_url }}
+        run: |
+          set -euo pipefail
+          # audience = scheme+host van de ingest-url (wat de gateway verwacht).
+          AUD=$(printf '%s' "$INGEST_URL" | sed -E 's#(https?://[^/]+).*#\1#')
+          echo "OIDC-audience: $AUD"
+          TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
+          test -n "$TOKEN" -a "$TOKEN" != "null" || { echo "geen OIDC-token verkregen"; exit 1; }
+          echo "Push naar $INGEST_URL ..."
+          curl -sS --fail-with-body \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "sbom=@sbom.cdx.json" \
+            -F "bundle=@sbom.cdx.json.bundle" \
+            "$INGEST_URL"
