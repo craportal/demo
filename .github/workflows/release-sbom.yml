@@ -70,6 +70,26 @@ jobs:
             sbom.cdx.json
           echo "Rekor-entry + Fulcio-cert zitten in de bundle; verify-blob leest 'm terug."
 
+      # 5.1 — bouw het ECHTE artefact (build-but-don't-publish: de image blijft in de
+      # runner en wordt NERGENS naartoe gepusht) → de basis voor een onafhankelijke SBOM.
+      - name: Bouw artefact-image (geen push)
+        run: docker build -t "craportal-demo-artifact:${GITHUB_SHA}" .
+
+      # 5.2 — artefact-SBOM: syft op de GEBOUWDE image (wat er écht in zit, incl. de
+      # tijdens de build geïnstalleerde dependencies) — onafhankelijk van de source-SBOM.
+      - name: Genereer CycloneDX artefact-SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: craportal-demo-artifact:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: artifact.cdx.json
+
+      - name: Keyless sign van de artefact-SBOM
+        run: |
+          cosign sign-blob --yes \
+            --bundle artifact.cdx.json.bundle \
+            artifact.cdx.json
+
       # 1.3 — SLSA build-provenance: bindt de SBOM-digest aan commit-SHA + run-ID.
       - name: SLSA build-provenance voor de SBOM
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -85,16 +105,19 @@ jobs:
           path: |
             sbom.cdx.json
             sbom.cdx.json.bundle
+            artifact.cdx.json
+            artifact.cdx.json.bundle
           if-no-files-found: error
 
       # 2.4 — keyless PUSH naar de pipeline-ingest (Fase 2.4). Alleen bij een
       # handmatige dispatch mét ingest_url (tag/PR-runs slaan dit over → geen ruis).
       # Auth = een kortlevend GitHub-OIDC-token; de gateway verifieert het tegen
       # GitHub's JWKS en leest de repository-claim. Geen gedeelde sleutel.
-      - name: Push SBOM naar pipeline-ingest (keyless OIDC)
+      - name: Push source- + artefact-SBOM naar pipeline-ingest (keyless OIDC)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.ingest_url != '' }}
         env:
           INGEST_URL: ${{ inputs.ingest_url }}
+          BUILD_ID: ${{ github.sha }}
         run: |
           set -euo pipefail
           # audience = scheme+host van de ingest-url (wat de gateway verwacht).
@@ -103,9 +126,15 @@ jobs:
           TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
           test -n "$TOKEN" -a "$TOKEN" != "null" || { echo "geen OIDC-token verkregen"; exit 1; }
-          echo "Push naar $INGEST_URL ..."
-          curl -sS --fail-with-body \
-            -H "Authorization: Bearer $TOKEN" \
-            -F "sbom=@sbom.cdx.json" \
-            -F "bundle=@sbom.cdx.json.bundle" \
-            "$INGEST_URL"
+          # Beide SBOM's onder dezelfde build_id (commit-SHA) zodat de verify-worker
+          # ze als paar herkent en kan vergelijken (dual-SBOM-gate, Fase 5).
+          push() {
+            echo "Push kind=$1 (build $BUILD_ID) → $INGEST_URL"
+            curl -sS --fail-with-body \
+              -H "Authorization: Bearer $TOKEN" \
+              -F "sbom=@$2" -F "bundle=@$3" \
+              "$INGEST_URL?kind=$1&build_id=$BUILD_ID"
+            echo
+          }
+          push source   sbom.cdx.json     sbom.cdx.json.bundle
+          push artifact artifact.cdx.json artifact.cdx.json.bundle
