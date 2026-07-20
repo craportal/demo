@@ -50,7 +50,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # 1.1 — CycloneDX source-SBOM van de repo (syft onder de motorkap).
+      # 5.0 — resolveer de gedeclareerde deps naar een lockfile (GEEN install, GEEN
+      # scripts) zodat de source-SBOM de volledige, resolved npm-boom bevat en
+      # vergelijkbaar is met het artefact. Deze repo commit (nog) geen lockfile.
+      - name: Resolveer npm-deps (lockfile-only)
+        run: npm install --package-lock-only --ignore-scripts
+
+      # 1.1 — CycloneDX source-SBOM van de repo (syft leest de package-lock.json).
       - name: Genereer CycloneDX source-SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
