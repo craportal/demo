@@ -1,0 +1,88 @@
+# ============================================================================
+# release-sbom — Fase 1 van het implementatieplan (§ FASE 1: signen + provenance).
+#
+# Doel: elke build produceert een GETEKENDE, PROVENANCE-GEDEKTE CycloneDX-SBOM,
+# extern verifieerbaar ZONDER toegang tot onze systemen (EXIT-GATE 1).
+#
+# Keyless: er staat GEEN sleutel in de repo. De job gebruikt de ambient
+# GitHub-OIDC-token (`id-token: write`) → Fulcio geeft een kortlevend cert →
+# de signature + provenance belanden in de PUBLIEKE Sigstore-transparency-log
+# (Rekor). Dat is bewust publiek: de sales/demo-waarde is dat iederéén het kan
+# verifiëren zonder onze infra.
+#
+# Verifiëren na een run (EXIT-GATE 1 — geen toegang tot onze systemen nodig):
+#   COSIGN_EXPERIMENTAL=1 cosign verify-blob \
+#     --bundle sbom.cdx.json.bundle \
+#     --certificate-identity-regexp 'https://github.com/craportal/demo/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     sbom.cdx.json
+#   gh attestation verify sbom.cdx.json --repo craportal/demo
+#
+# 1.4 hardening: alle actions op commit-SHA gepind (0 tag-refs), permissions
+# minimaal, `id-token: write` alleen op deze job. Bump-cadans: dependabot of een
+# kwartaal-review resolvet de SHA's opnieuw (tag in de comment = leesbaarheid).
+# ============================================================================
+name: release-sbom
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+  # Same-repo PR's krijgen write-OIDC + attestations (forks niet) → de PR is
+  # meteen het review-pad én de eerste echte run (EXIT-GATE 1-bewijs).
+  pull_request:
+    branches:
+      - 'create-pull-request/patch'
+
+# Least-privilege op workflow-niveau; de job verhoogt alleen wat hij nodig heeft.
+permissions:
+  contents: read
+
+jobs:
+  sbom-sign-provenance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # checkout
+      id-token: write       # keyless OIDC (cosign + attestations)
+      attestations: write   # actions/attest-build-provenance schrijft de attestatie
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # 1.1 — CycloneDX source-SBOM van de repo (syft onder de motorkap).
+      - name: Genereer CycloneDX source-SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          artifact-name: sbom.cdx.json
+
+      # 1.2 — keyless cosign-sign van de SBOM → signature-bundle + publieke Rekor-entry.
+      - name: Installeer cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Keyless sign van de SBOM (Sigstore → publieke Rekor)
+        run: |
+          cosign sign-blob --yes \
+            --bundle sbom.cdx.json.bundle \
+            sbom.cdx.json
+          echo "Rekor-entry + Fulcio-cert zitten in de bundle; verify-blob leest 'm terug."
+
+      # 1.3 — SLSA build-provenance: bindt de SBOM-digest aan commit-SHA + run-ID.
+      - name: SLSA build-provenance voor de SBOM
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: sbom.cdx.json
+
+      # Bewaar SBOM + cosign-bundle als run-artefact (de SBOM zelf upload de
+      # sbom-action al; de bundle voegen we hier expliciet toe).
+      - name: Upload signed-SBOM-bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom-signed
+          path: |
+            sbom.cdx.json
+            sbom.cdx.json.bundle
+          if-no-files-found: error
