@@ -28,12 +28,16 @@ on:
   workflow_dispatch:
     inputs:
       ingest_url:
-        description: 'Optioneel: push de getekende SBOM naar deze pipeline-ingest (bv. https://william.dev.pipeline.trustengine.eu/ingest). Leeg = niet pushen.'
+        description: 'Optioneel: override de pipeline-ingest-URL (anders repo-var PIPELINE_INGEST_URL).'
         required: false
         default: ''
   push:
-    tags:
-      - 'v*'
+    # Release-tags + main = productie-relevante posture; feature-branches =
+    # shift-left (delta-scan in de PR). De gateway keyt op ref + build_id.
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+    branches: ['**']
 
 # Least-privilege op workflow-niveau; de job verhoogt alleen wat hij nodig heeft.
 permissions:
@@ -119,27 +123,33 @@ jobs:
       # handmatige dispatch mét ingest_url (tag/PR-runs slaan dit over → geen ruis).
       # Auth = een kortlevend GitHub-OIDC-token; de gateway verifieert het tegen
       # GitHub's JWKS en leest de repository-claim. Geen gedeelde sleutel.
+      # 2.4 / F4 — keyless PUSH naar de pipeline-ingest. URL = dispatch-override óf de
+      # repo-variabele PIPELINE_INGEST_URL (zo pushen branch-/tag-/PR-runs automatisch,
+      # zonder handmatige dispatch). Geen URL geconfigureerd → stap slaat over (geen ruis).
+      # De ref (branch/tag) gaat mee zodat de gateway per ref keyt + PR-delta-vs-main kan.
       - name: Push source- + artefact-SBOM naar pipeline-ingest (keyless OIDC)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.ingest_url != '' }}
+        if: ${{ inputs.ingest_url != '' || vars.PIPELINE_INGEST_URL != '' }}
         env:
-          INGEST_URL: ${{ inputs.ingest_url }}
+          INGEST_URL: ${{ inputs.ingest_url != '' && inputs.ingest_url || vars.PIPELINE_INGEST_URL }}
           BUILD_ID: ${{ github.sha }}
+          REF: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           # audience = scheme+host van de ingest-url (wat de gateway verwacht).
           AUD=$(printf '%s' "$INGEST_URL" | sed -E 's#(https?://[^/]+).*#\1#')
-          echo "OIDC-audience: $AUD"
+          echo "OIDC-audience: $AUD | ref: $REF"
           TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUD" | jq -r '.value')
           test -n "$TOKEN" -a "$TOKEN" != "null" || { echo "geen OIDC-token verkregen"; exit 1; }
-          # Beide SBOM's onder dezelfde build_id (commit-SHA) zodat de verify-worker
-          # ze als paar herkent en kan vergelijken (dual-SBOM-gate, Fase 5).
+          # Beide SBOM's onder dezelfde build_id (commit-SHA) + ref, zodat de verify-worker
+          # ze als paar herkent (dual-SBOM-gate) en per ref kan bijhouden (branch-delta).
+          REF_ENC=$(jq -rn --arg r "$REF" '$r|@uri')
           push() {
-            echo "Push kind=$1 (build $BUILD_ID) → $INGEST_URL"
+            echo "Push kind=$1 (build $BUILD_ID, ref $REF) → $INGEST_URL"
             curl -sS --fail-with-body \
               -H "Authorization: Bearer $TOKEN" \
               -F "sbom=@$2" -F "bundle=@$3" \
-              "$INGEST_URL?kind=$1&build_id=$BUILD_ID"
+              "$INGEST_URL?kind=$1&build_id=$BUILD_ID&ref=$REF_ENC"
             echo
           }
           push source   sbom.cdx.json     sbom.cdx.json.bundle
