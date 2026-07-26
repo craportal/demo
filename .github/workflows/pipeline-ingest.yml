@@ -64,12 +64,15 @@ jobs:
           test -n "$TOKEN" -a "$TOKEN" != "null" || { echo "geen OIDC-token"; exit 1; }
 
           # 1) Dossier (eidp-api) — JSON-body {"sbom": base64}. Repo->product via binding.
+          #    De SBOM kan MB's zijn: body via een BESTAND (jq bouwt 'm, curl leest @file)
+          #    — inline zou ARG_MAX overschrijden.
           if [ -n "$DOSSIER_URL" ]; then
             echo "== dossier -> $DOSSIER_URL/sbom =="
-            B64=$(base64 -w0 sbom.cdx.json 2>/dev/null || base64 sbom.cdx.json | tr -d '\n')
+            base64 -w0 sbom.cdx.json > sbom.b64 2>/dev/null || base64 sbom.cdx.json | tr -d '\n' > sbom.b64
+            jq -Rn --rawfile s sbom.b64 '{sbom:$s}' > dossier-body.json
             curl -sS --fail-with-body -X PUT \
               -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-              --data-binary "{\"sbom\":\"$B64\"}" \
+              --data-binary @dossier-body.json \
               "$DOSSIER_URL/sbom"
             echo
           fi
