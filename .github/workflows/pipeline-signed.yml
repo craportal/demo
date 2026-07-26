@@ -1,0 +1,55 @@
+# ============================================================================
+# pipeline-signed — de ONWEERLEGBAARHEIDS-run. Draait op een SELF-HOSTED runner op
+# het lokale net zodat cosign/Fulcio + Rekor PRIVAAT blijven (nooit extern).
+#
+# Tekent de SBOM keyless tegen de LOKALE Fulcio (github-workflow-issuer -> cert-SAN =
+# de job_workflow_ref-URI met owner/repo) en pusht 'm ONDERTEKEND via de BFF naar de
+# eidp-dossier-ingest. Daar draait de acceptance-gate: signature verifieert tegen de
+# Fulcio-cert-pubkey, cert-SAN == de repo->product-binding, subject-digest == de SBOM.
+#
+# Vereist: binding op require_signing=true. Lokale services (self-hosted runner bereikt
+# ze via localhost): Fulcio :5555, BFF :9080.
+# ============================================================================
+name: pipeline-signed
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  sign-and-ingest:
+    runs-on: [self-hosted, local-signer]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      FULCIO_URL: http://localhost:5555
+      INGEST_URL: http://localhost:9080/ci-ingest
+      INGEST_AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolveer npm-deps (lockfile-only)
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Installeer syft (lokaal, geen sudo)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Genereer CycloneDX-SBOM + stempel de versie
+        run: |
+          syft scan dir:. -o cyclonedx-json=sbom.raw.json
+          # eidp leidt de versie af uit metadata.component.version; zet 'm op de ref.
+          jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' sbom.raw.json > sbom.cdx.json
+
+      - name: Keyless-sign tegen lokale Fulcio + push ondertekend naar de BFF
+        env:
+          SBOM_PATH: sbom.cdx.json
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" -q install cryptography
+          "$RUNNER_TEMP/venv/bin/python" .github/scripts/sign_and_push.py
