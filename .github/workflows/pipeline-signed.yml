@@ -42,7 +42,7 @@ jobs:
 
       - name: Genereer CycloneDX-SBOM + stempel de versie
         run: |
-          syft scan dir:. -o cyclonedx-json=sbom.raw.json
+          syft scan dir:. -o cyclonedx-json@1.5=sbom.raw.json
           # eidp leidt de versie af uit metadata.component.version; zet 'm op de ref.
           jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' sbom.raw.json > sbom.cdx.json
 
