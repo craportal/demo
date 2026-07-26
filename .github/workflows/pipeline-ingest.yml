@@ -63,6 +63,11 @@ jobs:
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r '.value')
           test -n "$TOKEN" -a "$TOKEN" != "null" || { echo "geen OIDC-token"; exit 1; }
 
+          # eidp-api leidt de DT-projectVersion af uit metadata.component.version; de
+          # syft-SBOM van deze repo zet die niet -> stempel 'm op de ref (branch/tag).
+          jq --arg v "$REF" '.metadata.component.version = $v' sbom.cdx.json > sbom.versioned.json
+          mv sbom.versioned.json sbom.cdx.json
+
           # 1) Dossier (eidp-api) — JSON-body {"sbom": base64}. Repo->product via binding.
           #    De SBOM kan MB's zijn: body via een BESTAND (jq bouwt 'm, curl leest @file)
           #    — inline zou ARG_MAX overschrijden.
