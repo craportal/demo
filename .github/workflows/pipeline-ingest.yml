@@ -1,0 +1,89 @@
+# ============================================================================
+# pipeline-ingest — transport-first: pusht een ECHTE CycloneDX-SBOM via de BFF
+# naar het dossier (eidp-api) én het bewijs/checks-spoor (supply-chain-hub).
+#
+# Alles loopt via de BFF (APISIX): die valideert het GitHub-OIDC-token KEYLESS
+# tegen GitHub's JWKS (geen secret) en injecteert de geverifieerde identiteit
+# (X-Userinfo). eidp-api resolvet repo->product via de binding en landt de SBOM;
+# de hub landt 'm in WORM + draait de checks.
+#
+# Deze variant TEKENT (nog) NIET — de cosign-acceptance-gate wordt lokaal getoetst
+# zodra de signed-run op een self-hosted runner tegen de LOKALE Fulcio/Rekor draait
+# (Fulcio/Rekor blijven privaat, nooit extern). Zet dan de binding op require_signing.
+#
+# Repo-variabelen (Settings -> Secrets and variables -> Actions -> Variables):
+#   INGEST_DOSSIER_URL   bv. https://william.dev.pipeline.trustengine.eu/ci-ingest
+#   INGEST_EVIDENCE_URL  bv. https://william.dev.pipeline.trustengine.eu/ci-evidence/ingest
+#   INGEST_AUDIENCE      bv. api.trustengine.eu   (== de BFF openid-connect client_id)
+# ============================================================================
+name: pipeline-ingest
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # checkout
+      id-token: write     # keyless GitHub-OIDC-token (transport-auth naar de BFF)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Resolveer de deps naar een lockfile (geen install/scripts) zodat de SBOM de
+      # volledige, resolved npm-boom bevat.
+      - name: Resolveer npm-deps (lockfile-only)
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Genereer CycloneDX-SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Push SBOM via de BFF naar dossier (eidp) + bewijs (hub)
+        env:
+          DOSSIER_URL: ${{ vars.INGEST_DOSSIER_URL }}
+          EVIDENCE_URL: ${{ vars.INGEST_EVIDENCE_URL }}
+          AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
+          BUILD_ID: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -n "$AUDIENCE" || { echo "INGEST_AUDIENCE (repo-var) ontbreekt"; exit 1; }
+
+          # Keyless GitHub-OIDC-token, audience == de BFF-client_id. De BFF valideert
+          # het tegen GitHub's JWKS en injecteert X-Userinfo; geen gedeelde sleutel.
+          TOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -r '.value')
+          test -n "$TOKEN" -a "$TOKEN" != "null" || { echo "geen OIDC-token"; exit 1; }
+
+          # 1) Dossier (eidp-api) — JSON-body {"sbom": base64}. Repo->product via binding.
+          if [ -n "$DOSSIER_URL" ]; then
+            echo "== dossier -> $DOSSIER_URL/sbom =="
+            B64=$(base64 -w0 sbom.cdx.json 2>/dev/null || base64 sbom.cdx.json | tr -d '\n')
+            curl -sS --fail-with-body -X PUT \
+              -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+              --data-binary "{\"sbom\":\"$B64\"}" \
+              "$DOSSIER_URL/sbom"
+            echo
+          fi
+
+          # 2) Bewijs/checks (hub) — multipart; ref + build_id zodat de verify-worker
+          #    per build/ref keyt (dual-SBOM-gate + branch-delta). Best-effort: een
+          #    hub-binding-/config-probleem mag de dossier-push niet laten falen.
+          if [ -n "$EVIDENCE_URL" ]; then
+            echo "== bewijs -> $EVIDENCE_URL =="
+            REF_ENC=$(jq -rn --arg r "$REF" '$r|@uri')
+            curl -sS --fail-with-body \
+              -H "Authorization: Bearer $TOKEN" \
+              -F "sbom=@sbom.cdx.json" \
+              "$EVIDENCE_URL?kind=artifact&build_id=$BUILD_ID&ref=$REF_ENC" \
+              || echo "evidence-push faalde (non-fataal in transport-first)"
+            echo
+          fi
