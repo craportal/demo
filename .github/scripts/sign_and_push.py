@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.parse
 import urllib.request
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -91,6 +92,9 @@ def main() -> None:
     fulcio_url = os.environ["FULCIO_URL"]
     ingest_url = os.environ["INGEST_URL"].rstrip("/")
     audience = os.environ["INGEST_AUDIENCE"]
+    evidence_url = os.environ.get("EVIDENCE_URL", "").rstrip("/")
+    build_id = os.environ.get("BUILD_ID", "")
+    ref = os.environ.get("REF", "")
 
     sbom = open(sbom_path, "rb").read()
 
@@ -134,10 +138,48 @@ def main() -> None:
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            print("ingest OK:", resp.read().decode())
+            print("dossier ingest OK:", resp.read().decode())
     except urllib.error.HTTPError as exc:
-        print(f"ingest FAILED {exc.code}: {exc.read().decode()}", file=sys.stderr)
+        print(f"dossier ingest FAILED {exc.code}: {exc.read().decode()}", file=sys.stderr)
         raise SystemExit(1)
+
+    # Evidence-tak (supply-chain-hub) — dezelfde ondertekende SBOM + een DSSE+cert-
+    # bundle die de verify-worker native verifieert (geen cosign/TUF) en naar WORM
+    # promoot → voedt de Provenance-tab. Best-effort t.o.v. het dossier.
+    if evidence_url:
+        bundle = json.dumps(
+            {"dsseEnvelope": envelope, "certificate": cert_pem}
+        ).encode()
+        body, content_type = _multipart(
+            {"sbom": ("sbom.cdx.json", sbom), "bundle": ("bundle.json", bundle)}
+        )
+        query = urllib.parse.urlencode({"kind": "artifact", "build_id": build_id, "ref": ref})
+        ev_req = urllib.request.Request(
+            f"{evidence_url}?{query}",
+            data=body,
+            method="POST",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
+        )
+        try:
+            with urllib.request.urlopen(ev_req, timeout=60) as resp:
+                print("evidence ingest OK:", resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            print(f"evidence ingest faalde (non-fataal) {exc.code}: {exc.read().decode()}")
+
+
+def _multipart(fields: dict[str, tuple[str, bytes]]) -> tuple[bytes, str]:
+    """Bouw een multipart/form-data body (stdlib) uit {veld: (bestandsnaam, bytes)}."""
+    boundary = "----trustengineboundary7f3a9c"
+    out = bytearray()
+    for name, (filename, content) in fields.items():
+        out += f"--{boundary}\r\n".encode()
+        out += (
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        out += content + b"\r\n"
+    out += f"--{boundary}--\r\n".encode()
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ jobs:
     env:
       FULCIO_URL: http://localhost:5555
       INGEST_URL: http://localhost:9080/ci-ingest
+      EVIDENCE_URL: http://localhost:9080/ci-evidence/ingest
       INGEST_AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
     steps:
       - name: Checkout
@@ -49,6 +50,8 @@ jobs:
       - name: Keyless-sign tegen lokale Fulcio + push ondertekend naar de BFF
         env:
           SBOM_PATH: sbom.cdx.json
+          BUILD_ID: ${{ github.sha }}
+          REF: ${{ github.ref_name }}
         run: |
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" -q install cryptography
