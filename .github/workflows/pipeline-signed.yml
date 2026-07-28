@@ -56,3 +56,5 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" -q install cryptography
           "$RUNNER_TEMP/venv/bin/python" .github/scripts/sign_and_push.py
+
+# verify-loop e2e: 2026-07-28T10:39:47Z
