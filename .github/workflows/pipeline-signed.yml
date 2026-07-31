@@ -2,7 +2,7 @@
 # pipeline-signed — de ONWEERLEGBAARHEIDS-run. Draait op een SELF-HOSTED runner op
 # het lokale net zodat cosign/Fulcio + Rekor PRIVAAT blijven (nooit extern).
 #
-# Tekent de SBOM keyless tegen de LOKALE Fulcio (github-workflow-issuer -> cert-SAN =
+# Tekent BEIDE SBOM's (broncode + gebouwd artefact) keyless tegen de LOKALE Fulcio (github-workflow-issuer -> cert-SAN =
 # de job_workflow_ref-URI met owner/repo) en pusht 'm ONDERTEKEND via de BFF naar de
 # eidp-dossier-ingest. Daar draait de acceptance-gate: signature verifieert tegen de
 # Fulcio-cert-pubkey, cert-SAN == de repo->product-binding, subject-digest == de SBOM.
@@ -41,15 +41,39 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$RUNNER_TEMP/bin"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      - name: Genereer CycloneDX-SBOM + stempel de versie
+      - name: Genereer CycloneDX source-SBOM + stempel de versie
         run: |
-          syft scan dir:. -o cyclonedx-json@1.5=sbom.raw.json
+          syft scan dir:. -o cyclonedx-json@1.5=source.raw.json
           # eidp leidt de versie af uit metadata.component.version; zet 'm op de ref.
-          jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' sbom.raw.json > sbom.cdx.json
+          jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' source.raw.json > source.cdx.json
 
-      - name: Keyless-sign tegen lokale Fulcio + push ondertekend naar de BFF
+      # Het artefact zelf. Zonder deze stap is er alleen een broncode-scan, en dan kan
+      # niemand aantonen dat wat er is uitgeleverd overeenkomt met wat er is
+      # gedeclareerd — precies het gat waar de dual-SBOM-vergelijking voor bestaat.
+      # Geen push: het image hoeft nergens heen, alleen gescand te worden.
+      - name: Bouw artefact-image (geen push)
+        run: docker build -t "trustengine-local/demo:${GITHUB_SHA}" .
+
+      - name: Bepaal artefact-image-digest
+        id: img
+        run: |
+          DIGEST=$(docker image inspect "trustengine-local/demo:${GITHUB_SHA}" \
+                     --format '{{index .Id}}')
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image-digest: $DIGEST"
+
+      - name: Genereer CycloneDX artefact-SBOM
+        run: |
+          syft scan "docker:trustengine-local/demo:${GITHUB_SHA}" \
+            -o cyclonedx-json@1.5=artifact.raw.json
+          jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' \
+            artifact.raw.json > artifact.cdx.json
+
+      - name: Keyless-sign tegen lokale Fulcio + push beide naar de BFF
         env:
-          SBOM_PATH: sbom.cdx.json
+          SOURCE_SBOM: source.cdx.json
+          ARTIFACT_SBOM: artifact.cdx.json
+          IMAGE_DIGEST: ${{ steps.img.outputs.digest }}
           BUILD_ID: ${{ github.sha }}
           REF: ${{ github.ref_name }}
         run: |

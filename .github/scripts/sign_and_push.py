@@ -87,8 +87,62 @@ def _fulcio_cert(fulcio_url: str, oidc_token: str, key: ec.EllipticCurvePrivateK
     return cert["chain"]["certificates"][0]
 
 
+def _sign(
+    sbom: bytes, fulcio_url: str, token: str, extra_subjects: list[dict]
+) -> tuple[dict, str]:
+    """Teken een SBOM keyless tegen de lokale Fulcio; levert envelope + cert."""
+    subjects = [
+        {"name": "sbom", "digest": {"sha256": hashlib.sha256(sbom).hexdigest()}}
+    ] + extra_subjects
+    statement = json.dumps(
+        {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": subjects,
+            "predicateType": "https://cyclonedx.org/bom",
+            "predicate": {},
+        }
+    ).encode()
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert_pem = _fulcio_cert(fulcio_url, token, key)
+    signature = key.sign(_pae(INTOTO_PAYLOAD_TYPE, statement), ec.ECDSA(hashes.SHA256()))
+    envelope = {
+        "payloadType": INTOTO_PAYLOAD_TYPE,
+        "payload": base64.b64encode(statement).decode(),
+        "signatures": [{"sig": base64.b64encode(signature).decode()}],
+    }
+    return envelope, cert_pem
+
+
+def _push_evidence(
+    evidence_url: str, token: str, kind: str, build_id: str, ref: str,
+    sbom: bytes, envelope: dict, cert_pem: str,
+) -> None:
+    """Push naar de evidence-tak onder een expliciete `kind`.
+
+    De kind is wat source en artefact tot een paar maakt: de verify-worker zoekt in
+    een build-map naar beide en vergelijkt ze pas als ze er allebei zijn. Eerder ging
+    de source-scan hier als `artifact` naar binnen — dan vormt het paar zich nooit en
+    draait de vergelijking dus nooit, terwijl het er in het dossier compleet uitziet.
+    """
+    bundle = json.dumps({"dsseEnvelope": envelope, "certificate": cert_pem}).encode()
+    body, content_type = _multipart(
+        {"sbom": (f"{kind}.cdx.json", sbom), "bundle": ("bundle.json", bundle)}
+    )
+    query = urllib.parse.urlencode({"kind": kind, "build_id": build_id, "ref": ref})
+    req = urllib.request.Request(
+        f"{evidence_url}?{query}",
+        data=body,
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            print(f"evidence ingest OK ({kind}):", resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        print(f"evidence ingest {kind} faalde (non-fataal) {exc.code}: {exc.read().decode()}")
+
+
 def main() -> None:
-    sbom_path = os.environ["SBOM_PATH"]
     fulcio_url = os.environ["FULCIO_URL"]
     ingest_url = os.environ["INGEST_URL"].rstrip("/")
     audience = os.environ["INGEST_AUDIENCE"]
@@ -96,38 +150,34 @@ def main() -> None:
     build_id = os.environ.get("BUILD_ID", "")
     ref = os.environ.get("REF", "")
 
-    sbom = open(sbom_path, "rb").read()
+    source_sbom = open(os.environ["SOURCE_SBOM"], "rb").read()
+    artifact_path = os.environ.get("ARTIFACT_SBOM", "")
+    artifact_sbom = open(artifact_path, "rb").read() if artifact_path else b""
+    image_digest = os.environ.get("IMAGE_DIGEST", "")
 
     # Eén GH-OIDC-token dekt zowel Fulcio (signing) als de BFF (push): zelfde audience.
     token = _mint_oidc_token(audience)
 
-    statement = json.dumps(
-        {
-            "_type": "https://in-toto.io/Statement/v1",
-            "subject": [
-                {"name": "sbom", "digest": {"sha256": hashlib.sha256(sbom).hexdigest()}}
-            ],
-            "predicateType": "https://cyclonedx.org/bom",
-            "predicate": {},
-        }
-    ).encode()
+    # De artefact-attestatie draagt TWEE subjects: de SBOM-digest, waar de
+    # acceptance-gate op controleert, én de image-digest, die het bewijs bindt aan wat
+    # er daadwerkelijk is uitgeleverd. Zonder die tweede hangt de attestatie aan een
+    # bestand in plaats van aan een release.
+    extra: list[dict] = []
+    if image_digest:
+        algo, _, hexdigest = image_digest.partition(":")
+        extra.append({"name": "image", "digest": {algo or "sha256": hexdigest or image_digest}})
 
-    key = ec.generate_private_key(ec.SECP256R1())
-    cert_pem = _fulcio_cert(fulcio_url, token, key)
-    signature = key.sign(_pae(INTOTO_PAYLOAD_TYPE, statement), ec.ECDSA(hashes.SHA256()))
+    # Het dossier krijgt het artefact als dat er is: dat is de runtime-waarheid.
+    # Zonder image-build valt het terug op de source, zodat de flow blijft werken.
+    dossier_sbom = artifact_sbom or source_sbom
+    dossier_env, dossier_cert = _sign(dossier_sbom, fulcio_url, token, extra if artifact_sbom else [])
 
-    envelope = {
-        "payloadType": INTOTO_PAYLOAD_TYPE,
-        "payload": base64.b64encode(statement).decode(),
-        "signatures": [{"sig": base64.b64encode(signature).decode()}],
-    }
-    print(f"signed keyless; cert SAN-bevat de workflow-identiteit; pushing -> {ingest_url}/sbom")
-
+    print(f"signed keyless; cert-SAN bevat de workflow-identiteit; pushing -> {ingest_url}/sbom")
     payload = json.dumps(
         {
-            "sbom": base64.b64encode(sbom).decode(),
-            "attestation": base64.b64encode(json.dumps(envelope).encode()).decode(),
-            "certificate": cert_pem,
+            "sbom": base64.b64encode(dossier_sbom).decode(),
+            "attestation": base64.b64encode(json.dumps(dossier_env).encode()).decode(),
+            "certificate": dossier_cert,
         }
     ).encode()
     req = urllib.request.Request(
@@ -143,28 +193,19 @@ def main() -> None:
         print(f"dossier ingest FAILED {exc.code}: {exc.read().decode()}", file=sys.stderr)
         raise SystemExit(1)
 
-    # Evidence-tak (supply-chain-hub) — dezelfde ondertekende SBOM + een DSSE+cert-
-    # bundle die de verify-worker native verifieert (geen cosign/TUF) en naar WORM
-    # promoot → voedt de Provenance-tab. Best-effort t.o.v. het dossier.
+    # Evidence-tak: beide SBOM's onder één build_id, elk met een eigen handtekening.
+    # Pas als het paar compleet is vergelijkt de verify-worker source tegen artefact —
+    # dat is de controle op build-injectie.
     if evidence_url:
-        bundle = json.dumps(
-            {"dsseEnvelope": envelope, "certificate": cert_pem}
-        ).encode()
-        body, content_type = _multipart(
-            {"sbom": ("sbom.cdx.json", sbom), "bundle": ("bundle.json", bundle)}
-        )
-        query = urllib.parse.urlencode({"kind": "artifact", "build_id": build_id, "ref": ref})
-        ev_req = urllib.request.Request(
-            f"{evidence_url}?{query}",
-            data=body,
-            method="POST",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": content_type},
-        )
-        try:
-            with urllib.request.urlopen(ev_req, timeout=60) as resp:
-                print("evidence ingest OK:", resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            print(f"evidence ingest faalde (non-fataal) {exc.code}: {exc.read().decode()}")
+        src_env, src_cert = _sign(source_sbom, fulcio_url, token, [])
+        _push_evidence(evidence_url, token, "source", build_id, ref, source_sbom, src_env, src_cert)
+        if artifact_sbom:
+            _push_evidence(
+                evidence_url, token, "artifact", build_id, ref,
+                artifact_sbom, dossier_env, dossier_cert,
+            )
+        else:
+            print("geen artefact-SBOM: alleen source gepusht, dus geen vergelijking")
 
 
 def _multipart(fields: dict[str, tuple[str, bytes]]) -> tuple[bytes, str]:
