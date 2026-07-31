@@ -1,6 +1,13 @@
 # ============================================================================
-# pipeline-signed — de ONWEERLEGBAARHEIDS-run. Draait op een SELF-HOSTED runner op
-# het lokale net zodat cosign/Fulcio + Rekor PRIVAAT blijven (nooit extern).
+# pipeline-signed — de ONWEERLEGBAARHEIDS-run, in twee taken.
+#
+# `build` draait op een GitHub-runner en doet het zware werk: het image bouwen en de
+# twee SBOM's genereren. `sign` draait op een SELF-HOSTED runner op het lokale net,
+# want alleen dáár zijn Fulcio en Rekor bereikbaar en die blijven PRIVAAT.
+#
+# Die splitsing is geen omweg om resources. Een ondertekenhost hoort geen zware builds
+# te draaien: dat maakt 'm traag, en het zet build-gereedschap op de machine die de
+# sleutels benadert. Hier bouwt de ene machine en tekent de andere.
 #
 # Tekent BEIDE SBOM's (broncode + gebouwd artefact) keyless tegen de LOKALE Fulcio (github-workflow-issuer -> cert-SAN =
 # de job_workflow_ref-URI met owner/repo) en pusht 'm ONDERTEKEND via de BFF naar de
@@ -19,16 +26,8 @@ permissions:
   contents: read
 
 jobs:
-  sign-and-ingest:
-    runs-on: [self-hosted, local-signer]
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      FULCIO_URL: http://localhost:5555
-      INGEST_URL: http://localhost:9080/ci-ingest
-      EVIDENCE_URL: http://localhost:9080/ci-evidence/ingest
-      INGEST_AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
+  build:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -36,7 +35,7 @@ jobs:
       - name: Resolveer npm-deps (lockfile-only)
         run: npm install --package-lock-only --ignore-scripts
 
-      - name: Installeer syft (lokaal, geen sudo)
+      - name: Installeer syft
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$RUNNER_TEMP/bin"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
@@ -57,23 +56,51 @@ jobs:
       - name: Bepaal artefact-image-digest
         id: img
         run: |
-          DIGEST=$(docker image inspect "trustengine-local/demo:${GITHUB_SHA}" \
-                     --format '{{index .Id}}')
+          DIGEST=$(docker image inspect "trustengine-local/demo:${GITHUB_SHA}" --format '{{index .Id}}')
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "image-digest: $DIGEST"
 
       - name: Genereer CycloneDX artefact-SBOM
         run: |
-          syft scan "docker:trustengine-local/demo:${GITHUB_SHA}" \
-            -o cyclonedx-json@1.5=artifact.raw.json
-          jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' \
-            artifact.raw.json > artifact.cdx.json
+          syft scan "docker:trustengine-local/demo:${GITHUB_SHA}" -o cyclonedx-json@1.5=artifact.raw.json
+          jq --arg v "${GITHUB_REF_NAME}" '.metadata.component.version = $v' artifact.raw.json > artifact.cdx.json
+
+      - name: Geef de SBOM's door aan de ondertekenaar
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sboms
+          path: |
+            source.cdx.json
+            artifact.cdx.json
+          retention-days: 1
+    outputs:
+      image_digest: ${{ steps.img.outputs.digest }}
+
+  sign-and-ingest:
+    needs: build
+    runs-on: [self-hosted, local-signer]
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      FULCIO_URL: http://localhost:5555
+      INGEST_URL: http://localhost:9080/ci-ingest
+      EVIDENCE_URL: http://localhost:9080/ci-evidence/ingest
+      INGEST_AUDIENCE: ${{ vars.INGEST_AUDIENCE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Haal de SBOM's op
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sboms
 
       - name: Keyless-sign tegen lokale Fulcio + push beide naar de BFF
         env:
           SOURCE_SBOM: source.cdx.json
           ARTIFACT_SBOM: artifact.cdx.json
-          IMAGE_DIGEST: ${{ steps.img.outputs.digest }}
+          IMAGE_DIGEST: ${{ needs.build.outputs.image_digest }}
           BUILD_ID: ${{ github.sha }}
           REF: ${{ github.ref_name }}
         run: |
